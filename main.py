@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from groq import Groq, APIStatusError
+import asyncio
 import httpx
 import json
 import os
@@ -216,56 +217,103 @@ async def search_spotify_track(
     return null_result
 
 
+async def spotify_get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+    max_retries: int = 4,
+) -> httpx.Response:
+    response: httpx.Response | None = None
+    for attempt in range(max_retries):
+        response = await client.get(url, params=params, headers=headers)
+        if response.status_code != 429:
+            return response
+        retry_after = int(response.headers.get("Retry-After", min(2**attempt, 8)))
+        await asyncio.sleep(retry_after)
+    return response  # type: ignore[return-value]
+
+
+def parse_spotify_track_items(items: list, seen_ids: set[str], limit: int) -> list[dict]:
+    tracks: list[dict] = []
+    for item in items:
+        track_id = item.get("id")
+        if not track_id or track_id in seen_ids:
+            continue
+        seen_ids.add(track_id)
+        artists = item.get("artists", [])
+        images = item.get("album", {}).get("images", [])
+        tracks.append(
+            {
+                "artist": artists[0]["name"] if artists else "",
+                "track": item.get("name", ""),
+                "spotify_url": item.get("external_urls", {}).get("spotify"),
+                "preview_url": item.get("preview_url"),
+                "album_image": images[0]["url"] if images else None,
+                "track_id": track_id,
+            }
+        )
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
 async def fetch_trending_tracks_search_fallback(
     token: str, limit: int = 15
 ) -> list[dict]:
-    """Fallback when playlist API is restricted — uses Search with market=IN."""
+    """Fetch trending-style tracks via Spotify Search (market=IN)."""
     seen_ids: set[str] = set()
     tracks: list[dict] = []
-    queries = ["viral india", "bollywood hits", "hindi trending"]
+    headers = {"Authorization": f"Bearer {token}"}
+    queries = ["bollywood", "hindi hits", "punjabi", "arijit singh", "viral india"]
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await spotify_get_with_retry(
+            client,
+            "https://api.spotify.com/v1/search",
+            headers=headers,
+            params={"q": "bollywood", "type": "track", "market": "IN", "limit": 50},
+        )
+        if response.status_code == 200:
+            tracks.extend(
+                parse_spotify_track_items(
+                    response.json().get("tracks", {}).get("items", []),
+                    seen_ids,
+                    limit,
+                )
+            )
+
         for query in queries:
             if len(tracks) >= limit:
                 break
-            response = await client.get(
+            response = await spotify_get_with_retry(
+                client,
                 "https://api.spotify.com/v1/search",
+                headers=headers,
                 params={
                     "q": query,
                     "type": "track",
                     "market": "IN",
                     "limit": min(limit - len(tracks), 10),
                 },
-                headers={"Authorization": f"Bearer {token}"},
             )
             if response.status_code != 200:
                 continue
-            for item in response.json().get("tracks", {}).get("items", []):
-                track_id = item.get("id")
-                if not track_id or track_id in seen_ids:
-                    continue
-                seen_ids.add(track_id)
-                artists = item.get("artists", [])
-                images = item.get("album", {}).get("images", [])
-                tracks.append(
-                    {
-                        "artist": artists[0]["name"] if artists else "",
-                        "track": item.get("name", ""),
-                        "spotify_url": item.get("external_urls", {}).get("spotify"),
-                        "preview_url": item.get("preview_url"),
-                        "album_image": images[0]["url"] if images else None,
-                        "track_id": track_id,
-                    }
+            tracks.extend(
+                parse_spotify_track_items(
+                    response.json().get("tracks", {}).get("items", []),
+                    seen_ids,
+                    limit - len(tracks),
                 )
-                if len(tracks) >= limit:
-                    break
+            )
 
     if not tracks:
         raise HTTPException(
             status_code=502,
             detail="Failed to fetch trending tracks from Spotify. Please try again later.",
         )
-    return tracks
+    return tracks[:limit]
 
 
 async def fetch_playlist_tracks(token: str, playlist_id: str, limit: int = 15) -> list[dict]:
@@ -387,7 +435,7 @@ async def recommend_quick(request: QuickDiscoverRequest):
 @app.get("/trending")
 async def trending():
     token = await get_spotify_token()
-    tracks = await fetch_playlist_tracks(token, VIRAL_50_INDIA_PLAYLIST_ID, limit=15)
+    tracks = await fetch_trending_tracks_search_fallback(token, limit=15)
 
     track_list = "\n".join(
         f"{i + 1}. {t['artist']} - {t['track']}" for i, t in enumerate(tracks)
