@@ -8,6 +8,8 @@ import httpx
 import json
 import os
 import re
+import time
+from pathlib import Path
 
 load_dotenv(override=True)
 
@@ -23,6 +25,9 @@ app.add_middleware(
 GROQ_MODEL = "llama-3.3-70b-versatile"
 VIRAL_50_INDIA_PLAYLIST_ID = "37i9dQZEVXbMWDif5SCBJq"
 TRENDING_FALLBACK_BLURB = "Trending right now"
+TRENDING_CACHE_TTL_SECONDS = 3600
+TRENDING_SEED_PATH = Path(__file__).parent / "trending_seed.json"
+_trending_server_cache: dict | None = None
 
 DEEP_SYSTEM_PROMPT = (
     "You are a music discovery expert helping users break their listening loop. "
@@ -230,8 +235,8 @@ async def spotify_get_with_retry(
         response = await client.get(url, params=params, headers=headers)
         if response.status_code != 429:
             return response
-        retry_after = int(response.headers.get("Retry-After", min(2**attempt, 8)))
-        await asyncio.sleep(retry_after)
+        retry_after = int(response.headers.get("Retry-After", 2))
+        await asyncio.sleep(min(retry_after, 3))
     return response  # type: ignore[return-value]
 
 
@@ -262,60 +267,65 @@ def parse_spotify_track_items(items: list, seen_ids: set[str], limit: int) -> li
 async def fetch_trending_tracks_search_fallback(
     token: str, limit: int = 15
 ) -> list[dict]:
-    """Fetch trending-style tracks via Spotify Search (market=IN)."""
-    seen_ids: set[str] = set()
-    tracks: list[dict] = []
+    """Fetch trending-style tracks via a single Spotify Search request."""
     headers = {"Authorization": f"Bearer {token}"}
-    queries = ["bollywood", "hindi hits", "punjabi", "arijit singh", "viral india"]
+    queries = ["bollywood", "hindi hits", "arijit singh"]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await spotify_get_with_retry(
-            client,
-            "https://api.spotify.com/v1/search",
-            headers=headers,
-            params={"q": "bollywood", "type": "track", "market": "IN", "limit": 50},
-        )
-        if response.status_code == 200:
-            tracks.extend(
-                parse_spotify_track_items(
-                    response.json().get("tracks", {}).get("items", []),
-                    seen_ids,
-                    limit,
-                )
-            )
-            if len(tracks) >= limit:
-                return tracks[:limit]
-
+    async with httpx.AsyncClient(timeout=20.0) as client:
         for query in queries:
-            if len(tracks) >= limit:
-                break
             response = await spotify_get_with_retry(
                 client,
                 "https://api.spotify.com/v1/search",
                 headers=headers,
-                params={
-                    "q": query,
-                    "type": "track",
-                    "market": "IN",
-                    "limit": min(limit - len(tracks), 10),
-                },
+                params={"q": query, "type": "track", "market": "IN", "limit": limit},
+                max_retries=1,
             )
             if response.status_code != 200:
                 continue
-            tracks.extend(
-                parse_spotify_track_items(
-                    response.json().get("tracks", {}).get("items", []),
-                    seen_ids,
-                    limit - len(tracks),
-                )
+            tracks = parse_spotify_track_items(
+                response.json().get("tracks", {}).get("items", []),
+                set(),
+                limit,
             )
+            if tracks:
+                return tracks
 
-    if not tracks:
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to fetch trending tracks from Spotify. Please try again later.",
-        )
-    return tracks[:limit]
+    raise HTTPException(
+        status_code=502,
+        detail="Failed to fetch trending tracks from Spotify. Please try again later.",
+    )
+
+
+def load_trending_seed() -> list[dict]:
+    if not TRENDING_SEED_PATH.exists():
+        return []
+    try:
+        with open(TRENDING_SEED_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data.get("tracks", [])
+        return data
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def get_cached_trending() -> list[dict] | None:
+    if not _trending_server_cache:
+        return None
+    if time.time() - _trending_server_cache["cached_at"] > TRENDING_CACHE_TTL_SECONDS:
+        return None
+    return _trending_server_cache["tracks"]
+
+
+def set_cached_trending(tracks: list[dict]) -> None:
+    global _trending_server_cache
+    _trending_server_cache = {"tracks": tracks, "cached_at": time.time()}
+
+
+async def fetch_live_trending_tracks() -> list[dict]:
+    token = await get_spotify_token()
+    tracks = await fetch_trending_tracks_search_fallback(token, limit=15)
+    return [{**track, "blurb": TRENDING_FALLBACK_BLURB} for track in tracks]
 
 
 async def fetch_playlist_tracks(token: str, playlist_id: str, limit: int = 15) -> list[dict]:
@@ -436,31 +446,21 @@ async def recommend_quick(request: QuickDiscoverRequest):
 
 @app.get("/trending")
 async def trending():
-    token = await get_spotify_token()
-    tracks = await fetch_trending_tracks_search_fallback(token, limit=15)
-
-    blurbs = [TRENDING_FALLBACK_BLURB] * len(tracks)
-    track_list = "\n".join(
-        f"{i + 1}. {t['artist']} - {t['track']}" for i, t in enumerate(tracks)
-    )
-    user_message = f"Write a trending blurb for each track:\n{track_list}"
+    cached = get_cached_trending()
+    if cached:
+        return {"tracks": cached}
 
     try:
-        content = await asyncio.wait_for(
-            asyncio.to_thread(groq_chat, TRENDING_SYSTEM_PROMPT, user_message, 400),
-            timeout=8.0,
-        )
-        parsed = parse_groq_blurbs(content, len(tracks))
-        for i, blurb in enumerate(parsed):
-            blurbs[i] = blurb
-    except (asyncio.TimeoutError, APIStatusError, json.JSONDecodeError, ValueError, HTTPException):
-        pass
-
-    result = []
-    for i, track in enumerate(tracks):
-        result.append({**track, "blurb": blurbs[i] if i < len(blurbs) else TRENDING_FALLBACK_BLURB})
-
-    return {"tracks": result}
+        result = await fetch_live_trending_tracks()
+        set_cached_trending(result)
+        return {"tracks": result}
+    except HTTPException:
+        seed = load_trending_seed()
+        if seed:
+            return {"tracks": seed}
+        if _trending_server_cache and _trending_server_cache.get("tracks"):
+            return {"tracks": _trending_server_cache["tracks"]}
+        raise
 
 
 @app.get("/search/artist")
