@@ -279,13 +279,8 @@ async def fetch_playlist_tracks(token: str, playlist_id: str, limit: int = 15) -
             },
             headers={"Authorization": f"Bearer {token}"},
         )
-        if response.status_code in (403, 404):
-            return await fetch_trending_tracks_search_fallback(token, limit)
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Failed to fetch Spotify playlist: {response.text[:200]}",
-            )
+            return await fetch_trending_tracks_search_fallback(token, limit)
 
     tracks = []
     for item in response.json().get("items", []):
@@ -308,10 +303,7 @@ async def fetch_playlist_tracks(token: str, playlist_id: str, limit: int = 15) -
             break
 
     if not tracks:
-        raise HTTPException(
-            status_code=502,
-            detail="Spotify playlist returned no tracks. Please try again later.",
-        )
+        return await fetch_trending_tracks_search_fallback(token, limit)
 
     return tracks
 
