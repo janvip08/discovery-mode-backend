@@ -283,6 +283,8 @@ async def fetch_trending_tracks_search_fallback(
                     limit,
                 )
             )
+            if len(tracks) >= limit:
+                return tracks[:limit]
 
         for query in queries:
             if len(tracks) >= limit:
@@ -437,21 +439,21 @@ async def trending():
     token = await get_spotify_token()
     tracks = await fetch_trending_tracks_search_fallback(token, limit=15)
 
+    blurbs = [TRENDING_FALLBACK_BLURB] * len(tracks)
     track_list = "\n".join(
         f"{i + 1}. {t['artist']} - {t['track']}" for i, t in enumerate(tracks)
     )
     user_message = f"Write a trending blurb for each track:\n{track_list}"
 
-    blurbs = [TRENDING_FALLBACK_BLURB] * len(tracks)
     try:
-        content = groq_chat(TRENDING_SYSTEM_PROMPT, user_message, max_tokens=400)
+        content = await asyncio.wait_for(
+            asyncio.to_thread(groq_chat, TRENDING_SYSTEM_PROMPT, user_message, 400),
+            timeout=8.0,
+        )
         parsed = parse_groq_blurbs(content, len(tracks))
         for i, blurb in enumerate(parsed):
             blurbs[i] = blurb
-    except APIStatusError as e:
-        if e.status_code != 429:
-            raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-    except (json.JSONDecodeError, ValueError):
+    except (asyncio.TimeoutError, APIStatusError, json.JSONDecodeError, ValueError, HTTPException):
         pass
 
     result = []
